@@ -66,8 +66,8 @@ RANDOM_SEED = None          # change this number to get a different random run
 #  SECTION 2: BUILD THE NETWORK
 # ─────────────────────────────────────────────
 
-def build_network(seed=None, household_num = NUM_HOUSEHOLDS,  household_avg = HOUSEHOLD_SIZE_MEAN,
-                  household_std = HOUSEHOLD_SIZE_STD):
+def build_network(seed=None, household_num=NUM_HOUSEHOLDS,  household_avg=HOUSEHOLD_SIZE_MEAN,
+                  household_std=HOUSEHOLD_SIZE_STD):
     """
     Builds the two-layer network from scratch.
     Called once at startup and again on reset.
@@ -150,7 +150,7 @@ def sir_step(G):
     Returns the community edges used this step (so we can draw them).
     """
     comm_edges = build_community_edges(G)
-    all_edges  = list(G.edges()) + comm_edges   # ← two layers combined
+    all_edges = list(G.edges()) + comm_edges   # ← two layers combined
 
     # collect new states WITHOUT applying yet (synchronous update)
     new_states = {n: G.nodes[n]['state'] for n in G.nodes()}
@@ -181,8 +181,10 @@ def sir_step(G):
 
 NODE_COLORS = {'S': '#378ADD', 'I': '#D85A30', 'R': '#1D9E75'}
 
+
 def get_node_colors(G):
     return [NODE_COLORS[G.nodes[n]['state']] for n in G.nodes()]
+
 
 def get_counts(G):
     s = sum(1 for n in G.nodes() if G.nodes[n]['state'] == 'S')

@@ -38,23 +38,24 @@ import random
 # ─────────────────────────────────────────────
 
 # --- Population ---
-N_NODES       = 100      # total number of people (nodes) in the simulation
-HOUSEHOLD_NUM = 10    # how many people live together in each household
-                        # N_NODES must be divisible by HOUSEHOLD_SIZE
+N_NODES = 0                 # number of people (nodes)
+HOUSEHOLD_SIZE_MEAN = 4     # average people per household
+HOUSEHOLD_SIZE_STD = 0.75
+NUM_HOUSEHOLDS = 15         # number of households
 
 # --- Disease parameters ---
-BETA  = 0.30   # transmission probability per contact per time step
-               # higher = disease spreads more easily (try 0.1 to 0.8)
-GAMMA = 0.2   # recovery probability per time step
-               # higher = people recover faster (try 0.05 to 0.5)
+BETA = 0.30                 # transmission probability per contact per time step
+                            # higher = disease spreads more easily (try 0.1 to 0.8)
+GAMMA = 0.2                 # recovery probability per time step
+                            # higher = people recover faster (try 0.05 to 0.5)
 
 # --- Temporal / activity parameters ---
-BASE_ACTIVITY = 0.1    # base probability that any node is "active" (makes
-                       # a community contact) on a given time step.
-                       # Each node also gets a small random personal modifier.
+BASE_ACTIVITY = 0.1         # base probability that any node is "active" (makes
+                            # a community contact) on a given time step.
+                            # Each node also gets a small random personal modifier.
 
 # --- Simulation length ---
-MAX_STEPS = 120        # maximum number of time steps to simulate
+MAX_STEPS = 120             # maximum number of time steps to simulate
 
 # --- Random seed (optional) ---
 # Setting a seed makes the simulation reproducible — same result every run.
@@ -69,7 +70,8 @@ RANDOM_SEED = None
 #  Edges here never disappear.
 # ─────────────────────────────────────────────
 
-def build_household_layer(n_nodes, household_num, seed=None):
+def build_household_layer(seed=None, household_num=NUM_HOUSEHOLDS, household_avg=HOUSEHOLD_SIZE_MEAN,
+                          household_std=HOUSEHOLD_SIZE_STD):
     """
     Creates a graph where every node is connected to everyone
     in their household. These edges are permanent throughout
@@ -92,16 +94,15 @@ def build_household_layer(n_nodes, household_num, seed=None):
         np.random.seed(seed)
 
     G = nx.Graph()          # create an empty undirected graph
-    G.add_nodes_from(range(n_nodes))  # add nodes 0, 1, 2, ..., N-1
+    global N_NODES
 
     households = {}  # will store {household_id: [node_ids]}
-
-    for i in range(n_nodes):
+    for i in range(household_num):
         # assign each node to a household
-        hh_id = random.randint(1, household_num)
-        if hh_id not in households:
-            households[hh_id] = []
-        households[hh_id].append(i)
+        for j in range(int(random.normalvariate(household_avg, household_std))):
+            N_NODES += 1
+            G.add_node(N_NODES)
+            households.setdefault(i, []).append(N_NODES)
 
     # now add edges within each household
     for hh_id, members in households.items():
@@ -554,7 +555,7 @@ def run_activity_experiment():
 
     for activity, color in zip(activity_levels, colors):
         # build fresh graph for each experiment
-        G_exp, hh_exp = build_household_layer(N_NODES, HOUSEHOLD_NUM, seed=RANDOM_SEED)
+        G_exp, hh_exp = build_household_layer(seed=RANDOM_SEED)
         G_exp = assign_activity_potentials(G_exp, activity, seed=RANDOM_SEED)
         G_exp, _ = initialize_sir_states(G_exp, initial_infected=1, seed=RANDOM_SEED)
 
@@ -583,12 +584,12 @@ def main():
     print("  TEMPORAL TWO-LAYER SIR SIMULATION")
     print("="*50 + "\n")
     print(f"Parameters:")
-    print(f"  N = {N_NODES} nodes, number of households = {HOUSEHOLD_NUM}")
+    print(f"  N = {N_NODES} nodes, number of households = {NUM_HOUSEHOLDS}")
     print(f"  β = {BETA}, γ = {GAMMA}, R₀ ≈ {BETA/GAMMA:.2f}")
     print(f"  base activity = {BASE_ACTIVITY}\n")
 
     # --- Step 1: build the two-layer graph ---
-    G, households = build_household_layer(N_NODES, HOUSEHOLD_NUM, seed=RANDOM_SEED)
+    G, households = build_household_layer(seed=RANDOM_SEED)
     G = assign_activity_potentials(G, BASE_ACTIVITY, seed=RANDOM_SEED)
     G, patient_zeros = initialize_sir_states(G, initial_infected=1, seed=RANDOM_SEED)
 
