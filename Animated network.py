@@ -44,29 +44,30 @@ import copy
 #  SECTION 1: PARAMETERS  ← change these!
 # ─────────────────────────────────────────────
 
-N_NODES        = 0      # number of people (nodes)
-HOUSEHOLD_SIZE_MEAN = 4      # average people per household
-HOUSEHOLD_SIZE_STD = 0.5
-NUM_HOUSEHOLDS = 11     # number of households
+N_NODES = 0                 # number of people (nodes)
+HOUSEHOLD_SIZE_MEAN = 4     # average people per household
+HOUSEHOLD_SIZE_STD = 0.75
+NUM_HOUSEHOLDS = 15         # number of households
 
-BETA           = 0.30    # transmission probability per contact per step
-GAMMA          = 0.20    # recovery probability per step
+BETA = 0.40                 # transmission probability per contact per step
+GAMMA = 0.20                # recovery probability per step
 
-BASE_ACTIVITY  = 0.30    # how often community edges appear (0=never, 1=always)
+BASE_ACTIVITY = 0.30        # how often community edges appear (0=never, 1=always)
 
-MAX_STEPS      = 120     # stop after this many steps even if I > 0
-ANIMATION_MS   = 400     # milliseconds between frames (lower = faster)
-                         # try 200 for fast, 800 for slow and easy to follow
+MAX_STEPS = 120             # stop after this many steps even if I > 0
+ANIMATION_MS = 400          # milliseconds between frames (lower = faster)
+                            # try 200 for fast, 800 for slow and easy to follow
 
-RANDOM_SEED    = None      # change this number to get a different random run
-                         # set to None for a different outcome every time
+RANDOM_SEED = None          # change this number to get a different random run
+                            # set to None for a different outcome every time
 
 
 # ─────────────────────────────────────────────
 #  SECTION 2: BUILD THE NETWORK
 # ─────────────────────────────────────────────
 
-def build_network(seed=None):
+def build_network(seed=None, household_num = NUM_HOUSEHOLDS,  household_avg = HOUSEHOLD_SIZE_MEAN,
+                  household_std = HOUSEHOLD_SIZE_STD):
     """
     Builds the two-layer network from scratch.
     Called once at startup and again on reset.
@@ -85,15 +86,15 @@ def build_network(seed=None):
 
     # --- assign households ---
     households = {}
-    for i in range(NUM_HOUSEHOLDS):
-        for j in range(int(random.normalvariate(HOUSEHOLD_SIZE_MEAN, HOUSEHOLD_SIZE_STD))):
+    for i in range(household_num):
+        for j in range(int(random.normalvariate(household_avg, household_std))):
             N_NODES += 1
             G.add_node(N_NODES)
             households.setdefault(i, []).append(N_NODES)
             G.nodes[N_NODES]['household'] = i
             # each node gets its own activity level (personal sociability)
             G.nodes[N_NODES]['activity'] = float(np.clip(
-            BASE_ACTIVITY + np.random.normal(0, 0.12), 0.05, 0.95
+                BASE_ACTIVITY + np.random.normal(0, 0.12), 0.05, 0.95
             ))
             G.nodes[N_NODES]['state'] = 'S'
 
