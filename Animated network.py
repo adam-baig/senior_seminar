@@ -47,7 +47,7 @@ import copy
 N_NODES        = 0      # number of people (nodes)
 HOUSEHOLD_SIZE_MEAN = 4      # average people per household
 HOUSEHOLD_SIZE_STD = 0.5
-NUM_HOUSEHOLDS = 10     # number of households
+NUM_HOUSEHOLDS = 11     # number of households
 
 BETA           = 0.30    # transmission probability per contact per step
 GAMMA          = 0.20    # recovery probability per step
