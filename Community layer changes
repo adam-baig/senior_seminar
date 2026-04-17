@@ -1,0 +1,1303 @@
+"""
+Temporal Structured SIRL Network Model
+========================================
+Complete implementation including everything discussed:
+
+  Mathematical model:
+    G_t = (V, E_H ∪ E_W(t) ∪ E_S(t) ∪ E_N ∪ E_SW(t))
+
+  Edge layers:
+    E_H       household edges        — always active             (purple)
+    E_W(t)    workplace edges        — weekdays only             (blue)
+    E_S(t)    school edges           — weekdays only, β scaled   (green)
+    E_N       neighbor edges         — all week, low β           (orange)
+    E_SW(t)   social weekend edges   — weekends only             (amber)
+
+  Disease states (SIRL):
+    S  susceptible
+    I  infected — still going out, all edges active
+    L  on sick leave — work/school/social_weekend edges OFF,
+                       household/neighbor edges STILL ACTIVE
+    R  recovered
+
+  State transitions:
+    S → I   with probability β_layer  via active edge with I or L node
+    I → L   with probability p_leave  (voluntary sick leave)
+    I → R   with probability γ        (natural recovery)
+    L → R   with probability γ_leave  (faster, resting at home)
+             OR after SICK_LEAVE_DURATION days
+
+  Child social activity:
+    Each child draws a_i ~ Beta(2, 3)  (skewed toward homebodied)
+    School and social_weekend edge β scaled by (a_i + a_j) / 2
+
+  Network structure:
+    - Random household sizes 2–6
+    - Households arranged in a circle (meta-random visual)
+    - Node shapes: ■ worker  ▲ child  ● stay-home
+    - All contacts pre-assigned — no random selection each step
+
+Requirements:
+    pip install networkx matplotlib numpy pandas Pillow
+"""
+
+import random
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
+
+
+# ============================================================
+# SECTION 1 — PARAMETERS
+# ============================================================
+
+INCUBATION_DAYS    = 4      # days patient zero spreads before showing symptoms
+                             # asymptomatic = still going to work, no sick leave yet
+NUM_SEED_INFECTED  = 1      # raise to 2-3 if you still see no spread
+
+# --- Population ---
+NUM_HOUSEHOLDS        = 20
+HOUSEHOLD_SIZE_MIN    = 2
+HOUSEHOLD_SIZE_MAX    = 6
+NUM_WORKPLACES        = 4
+NUM_SCHOOLS           = 2
+NUM_NEIGHBOR_GROUPS   = 4
+
+# --- Node type fractions ---
+FRAC_WORKERS          = 0.45
+FRAC_CHILDREN         = 0.30
+FRAC_STAY_HOME        = 0.25
+
+# --- Fixed contact sizes (drawn once at network creation) ---
+WORKER_CONTACTS       = (4, 7)   # coworkers per worker
+CHILD_CONTACTS        = (3, 5)   # school friends per child
+NEIGHBOR_CONTACTS     = (1, 2)   # stay-home: least connected group
+SOCIAL_WD_WORKERS     = (1, 3)   # weekend social contacts for workers
+SOCIAL_WD_CHILDREN    = (1, 2)   # weekend social contacts for children
+
+# --- Child social activity: a_i ~ Beta(alpha, beta) ---
+# Beta(2,3) skews left — most kids lean toward staying home
+# Change to Beta(3,2) to make kids more social
+CHILD_ACTIVITY_ALPHA  = 2
+CHILD_ACTIVITY_BETA   = 3
+
+# --- Layer transmission rates β ---
+BETA_HOUSEHOLD        = 0.15    # close prolonged contact
+BETA_WORK             = 0.08    # workplace
+BETA_SCHOOL           = 0.10    # school (further scaled by child activity)
+BETA_NEIGHBOR         = 0.02    # casual neighbor — low because all-week
+BETA_SOCIAL_WEEKEND   = 0.06    # weekend social
+
+# --- Recovery ---
+GAMMA                 = 0.07    # daily recovery prob for I nodes
+GAMMA_ON_LEAVE        = 0.18    # faster recovery while resting at home
+
+# --- Sick leave ---
+SICK_LEAVE_PROB       = 0.35    # prob infected node takes leave per day
+                                 # not everyone reports symptoms
+SICK_LEAVE_DURATION   = 4       # max days on leave before forced recovery
+
+# --- Simulation ---
+MAX_STEPS             = 120
+RANDOM_SEED           = 42
+
+# --- Visual colors ---
+LAYER_COLORS = {
+    "household"      : "#E6945E",  # orange
+    "work"           : "#EE9AFD",  # dark blue
+    "school"         : "#D4537E",  # pink
+    "neighbor"       : "#7EC8A0",  # pale green
+    "social_weekend" : "#FE838B",  # purple
+}
+
+BETA_BY_LAYER = {
+    "household"      : BETA_HOUSEHOLD,
+    "work"           : BETA_WORK,
+    "school"         : BETA_SCHOOL,
+    "neighbor"       : BETA_NEIGHBOR,
+    "social_weekend" : BETA_SOCIAL_WEEKEND,
+}
+
+STATE_COLORS = {
+    "S" : "#5B9BD5",   # blue
+    "I" : "#E24B4A",   # red
+    "L" : "#EF9F27",   # amber  — on sick leave
+    "R" : "#1D9E75",   # green
+}
+
+# Node shapes and sizes by type
+NODE_SHAPES = {"worker": "s", "child": "^", "stay_home": "o"}
+NODE_SIZES  = {"worker": 80,  "child": 90,  "stay_home": 70}
+
+DAY_NAMES   = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+# ============================================================
+# SECTION 2 — TIME PHASE AND EDGE ACTIVATION
+# ============================================================
+
+def get_phase(t):
+    """Returns 'weekday' or 'weekend' for timestep t."""
+    return "weekend" if (t % 7) in (5, 6) else "weekday"
+
+
+def edge_is_active(layer, phase):
+    """
+    Deterministic activation rule — no randomness in contact structure.
+
+    Neighbor edges are ALL WEEK (not just weekends) at low β.
+    Stay-home adults interact while workers/kids are out on weekdays,
+    and continue to see neighbors on weekends too.
+
+    p_ij(t) = β_layer  if layer active during phase(t)
+    p_ij(t) = 0        otherwise
+    """
+    if layer == "household":       return True
+    if layer == "work":            return phase == "weekday"
+    if layer == "school":          return phase == "weekday"
+    if layer == "neighbor":        return True            # all week
+    if layer == "social_weekend":  return phase == "weekend"
+    return False
+
+
+# ============================================================
+# SECTION 3 — BUILD NETWORK
+# ============================================================
+
+def build_network(seed=RANDOM_SEED):
+    """
+    Builds the full pre-assigned contact network.
+
+    Nodes:
+      - Random household size (HOUSEHOLD_SIZE_MIN to MAX)
+      - Type assigned by weighted random draw
+      - Children get a social_activity score from Beta(2,3)
+      - All outside contacts pre-assigned once — no random each step
+
+    Layers built:
+      1. Household  — clique within each household
+      2. Work       — fixed coworker groups
+      3. School     — fixed school friend groups (3–5)
+      4. Neighbor   — stay-home adults, 1–2 contacts, all week
+      5. Social_wkd — workers (1–3) and children (1–2), weekends
+    """
+    random.seed(seed)
+    G = nx.Graph()
+
+    node_types   = ["worker", "child", "stay_home"]
+    type_weights = [FRAC_WORKERS, FRAC_CHILDREN, FRAC_STAY_HOME]
+
+    households = []
+    node_id    = 0
+
+    # --- Assign nodes ---
+    for hh_id in range(NUM_HOUSEHOLDS):
+        hh_size = random.randint(HOUSEHOLD_SIZE_MIN, HOUSEHOLD_SIZE_MAX)
+        members = []
+
+        for _ in range(hh_size):
+            ntype = random.choices(node_types, weights=type_weights)[0]
+
+            # Child social activity from Beta distribution
+            if ntype == "child":
+                social_activity = round(
+                    random.betavariate(CHILD_ACTIVITY_ALPHA,
+                                       CHILD_ACTIVITY_BETA), 3)
+            else:
+                social_activity = 1.0
+
+            G.add_node(node_id,
+                       household       = hh_id,
+                       type            = ntype,
+                       workplace       = random.randint(0, NUM_WORKPLACES-1)
+                                         if ntype == "worker" else None,
+                       school          = random.randint(0, NUM_SCHOOLS-1)
+                                         if ntype == "child" else None,
+                       neighbor_group  = random.randint(0, NUM_NEIGHBOR_GROUPS-1)
+                                         if ntype == "stay_home" else None,
+                       social_activity = social_activity,
+                       state           = "S",
+                       leave_days      = 0,
+                       asymptomatic_days = 0)
+            members.append(node_id)
+            node_id += 1
+
+        households.append(members)
+
+    # --- Layer 1: Household edges (permanent, always active) ---
+    for members in households:
+        for a in range(len(members)):
+            for b in range(a + 1, len(members)):
+                G.add_edge(members[a], members[b], layer="household")
+
+    # --- Layer 2: Workplace edges (weekdays only) ---
+    workers_by_wp = {}
+    for n in G.nodes():
+        if G.nodes[n]["type"] == "worker":
+            workers_by_wp.setdefault(G.nodes[n]["workplace"], []).append(n)
+
+    for wp, workers in workers_by_wp.items():
+        for w in workers:
+            k      = random.randint(*WORKER_CONTACTS)
+            chosen = random.sample([x for x in workers if x != w],
+                                   min(k, len(workers)-1))
+            for c in chosen:
+                if not G.has_edge(w, c):
+                    G.add_edge(w, c, layer="work")
+
+    # --- Layer 3: School friend edges (weekdays only) ---
+    # Degree distribution 3–5, scaled by child social_activity at runtime
+    children_by_school = {}
+    for n in G.nodes():
+        if G.nodes[n]["type"] == "child":
+            children_by_school.setdefault(G.nodes[n]["school"], []).append(n)
+
+    for sc, children in children_by_school.items():
+        for child in children:
+            k      = random.randint(*CHILD_CONTACTS)
+            chosen = random.sample([x for x in children if x != child],
+                                   min(k, len(children)-1))
+            for c in chosen:
+                if not G.has_edge(child, c):
+                    G.add_edge(child, c, layer="school")
+
+    # --- Layer 4: Neighbor edges (all week, low β) ---
+    # Stay-home adults only — fewest outside contacts of any group
+    # Primary contact window: weekdays when workers/kids are out
+    stay_by_group = {}
+    for n in G.nodes():
+        if G.nodes[n]["type"] == "stay_home":
+            stay_by_group.setdefault(G.nodes[n]["neighbor_group"], []).append(n)
+
+    for ng, people in stay_by_group.items():
+        for person in people:
+            k      = random.randint(*NEIGHBOR_CONTACTS)
+            chosen = random.sample([x for x in people if x != person],
+                                   min(k, len(people)-1))
+            for c in chosen:
+                if not G.has_edge(person, c):
+                    G.add_edge(person, c, layer="neighbor")
+
+    # --- Layer 5: Social weekend edges ---
+    # Workers: 1–3 contacts from any workplace (cross-workplace weekend mixing)
+    # Children: 1–2 contacts from any school (also scaled by social_activity)
+    # Degree distribution intentionally lower than weekday groups
+    all_workers  = [n for n in G.nodes() if G.nodes[n]["type"] == "worker"]
+    all_children = [n for n in G.nodes() if G.nodes[n]["type"] == "child"]
+
+    for person in all_workers:
+        k      = random.randint(*SOCIAL_WD_WORKERS)
+        chosen = random.sample([x for x in all_workers if x != person],
+                               min(k, len(all_workers)-1))
+        for c in chosen:
+            if not G.has_edge(person, c):
+                G.add_edge(person, c, layer="social_weekend")
+
+    for person in all_children:
+        k      = random.randint(*SOCIAL_WD_CHILDREN)
+        chosen = random.sample([x for x in all_children if x != person],
+                               min(k, len(all_children)-1))
+        for c in chosen:
+            if not G.has_edge(person, c):
+                G.add_edge(person, c, layer="social_weekend")
+
+    # Seed patient zero
+   # Patient zero must be a worker so they definitely go to work
+    # and have coworker contacts during their asymptomatic window
+    worker_nodes = [n for n in G.nodes() if G.nodes[n]["type"] == "worker"]
+    seed_pool    = worker_nodes if worker_nodes else list(G.nodes())
+
+    for seed_node in random.sample(seed_pool, min(NUM_SEED_INFECTED, len(seed_pool))):
+        G.nodes[seed_node]["state"]             = "I"
+        G.nodes[seed_node]["asymptomatic_days"] = INCUBATION_DAYS
+    pos = compute_positions(households, seed)
+    return G, households, pos
+    # Asymptomatic: still going to work, no sick leave,
+    # spreading unknowingly before symptoms appear
+
+# ============================================================
+# SECTION 4 — CIRCULAR CLUSTER LAYOUT
+# ============================================================
+
+def compute_positions(households, seed=RANDOM_SEED):
+    """
+    Household centers evenly spaced on a large outer circle.
+    Nodes within each household in a tight inner circle.
+    Makes household clusters immediately visible.
+    """
+    rng    = random.Random(seed)
+    pos    = {}
+    n_hh   = len(households)
+    big_r  = 9.0
+    inner_r = 0.55
+
+    for hh_id, members in enumerate(households):
+        angle = 2 * np.pi * hh_id / n_hh - np.pi / 2
+        cx    = big_r * np.cos(angle)
+        cy    = big_r * np.sin(angle)
+        n     = len(members)
+
+        for i, node in enumerate(members):
+            if n == 1:
+                pos[node] = (cx + rng.uniform(-0.1, 0.1),
+                             cy + rng.uniform(-0.1, 0.1))
+            else:
+                a = 2 * np.pi * i / n
+                pos[node] = (
+                    cx + inner_r * np.cos(a) + rng.uniform(-0.05, 0.05),
+                    cy + inner_r * np.sin(a) + rng.uniform(-0.05, 0.05)
+                )
+    return pos
+
+
+# ============================================================
+# SECTION 5 — NODE DRAWING HELPER
+# ============================================================
+
+def draw_nodes_by_type(G, pos, state_dict, ax, size_scale=1.0):
+    """
+    Draws nodes with shape = type and color = state.
+    ■ square   = worker
+    ▲ triangle = child
+    ● circle   = stay-home adult
+    Blue=S  Red=I  Amber=L(sick leave)  Green=R
+    """
+    for ntype, shape in NODE_SHAPES.items():
+        nodelist = [n for n in G.nodes() if G.nodes[n]["type"] == ntype]
+        if not nodelist:
+            continue
+        nx.draw_networkx_nodes(
+            G, pos,
+            nodelist   = nodelist,
+            node_color = [STATE_COLORS[state_dict[n]] for n in nodelist],
+            node_shape = shape,
+            node_size  = int(NODE_SIZES[ntype] * size_scale),
+            linewidths = 0.6,
+            edgecolors = "white",
+            ax         = ax
+        )
+
+
+# ============================================================
+# SECTION 6 — SIRL STEP
+# ============================================================
+
+def sir_step(G, t):
+    """
+    One timestep of SIRL dynamics.
+
+    Transmission:
+      For each active edge (i,j):
+        - I or L node can infect S node (L nodes are home but still infectious)
+        - If either node is in L, work/school/social_weekend edges are skipped
+        - School and social_weekend edges for children scaled by social_activity
+
+    Sick leave:
+      I → L  with SICK_LEAVE_PROB per day (voluntary, not everyone)
+      I → R  with GAMMA (natural recovery without leave)
+      L → R  with GAMMA_ON_LEAVE (faster, resting) OR after SICK_LEAVE_DURATION
+
+    Key insight: L nodes are home, so:
+      - Household edges STAY ACTIVE  → can spread to family
+      - Neighbor edges STAY ACTIVE   → can spread to nearby stay-home adults
+      - Work/School edges DEACTIVATED → won't spread at workplace/school
+    """
+    phase      = get_phase(t)
+    new_states = {n: G.nodes[n]["state"] for n in G.nodes()}
+    new_ldays  = {n: G.nodes[n]["leave_days"] for n in G.nodes()}
+    new_asymptomatic_days = {n: G.nodes[n]["asymptomatic_days"] for n in G.nodes()}
+    infection_log = []
+
+    for u, v, data in G.edges(data=True):
+        layer = data.get("layer", "household")
+
+        # Skip edges dormant this phase
+        if not edge_is_active(layer, phase):
+            continue
+
+        # Sick leave: person is home — skip work, school, social_weekend
+        u_on_leave = G.nodes[u]["state"] == "L"
+        v_on_leave = G.nodes[v]["state"] == "L"
+        if layer in ("work", "school", "social_weekend"):
+            if u_on_leave or v_on_leave:
+                continue
+
+        beta = BETA_BY_LAYER.get(layer, 0.0)
+
+        # Scale school + social_weekend β by child social activity
+        if layer in ("school", "social_weekend"):
+            a_u = G.nodes[u].get("social_activity", 1.0)
+            a_v = G.nodes[v].get("social_activity", 1.0)
+            beta = beta * (a_u + a_v) / 2
+
+        # Both I and L nodes are infectious
+        u_infectious = G.nodes[u]["state"] in ("I", "L")
+        v_infectious = G.nodes[v]["state"] in ("I", "L")
+
+        if u_infectious and G.nodes[v]["state"] == "S":
+            if random.random() < beta:
+                new_states[v] = "I"
+                infection_log.append({"layer": layer, "node": v})
+
+        if v_infectious and G.nodes[u]["state"] == "S":
+            if random.random() < beta:
+                new_states[u] = "I"
+                infection_log.append({"layer": layer, "node": u})
+
+    # --- State transitions ---
+    for n in G.nodes():
+        state = G.nodes[n]["state"]
+
+        if state == "I":
+            asymp = G.nodes[n].get("asymptomatic_days", 0)
+
+            if asymp > 0:
+                new_asymptomatic_days[n] = asymp - 1
+
+            elif random.random() < SICK_LEAVE_PROB:
+             new_states[n] = "L"
+             new_ldays[n]  = 1
+
+            elif random.random() < GAMMA:
+                new_states[n] = "R"
+
+        elif state == "L":
+            days = G.nodes[n]["leave_days"] + 1
+            if days >= SICK_LEAVE_DURATION or random.random() < GAMMA_ON_LEAVE:
+                new_states[n] = "R"
+                new_ldays[n]  = 0
+            else:
+                new_ldays[n] = days
+
+    for n in G.nodes():
+        G.nodes[n]["state"]      = new_states[n]
+        G.nodes[n]["leave_days"] = new_ldays[n]
+        G.nodes[n]["asymptomatic_days"] = new_asymptomatic_days[n]
+
+    return infection_log
+
+
+# ============================================================
+# SECTION 7 — RUN SIMULATION
+# ============================================================
+
+def run_simulation(G, max_steps=MAX_STEPS):
+    """
+    Runs the full SIRL simulation.
+    Tracks S, I, L, R counts at every step.
+    """
+    history          = []
+    states_over_time = []
+    layer_totals     = {k: 0 for k in BETA_BY_LAYER}
+
+    def snapshot():
+        return {n: G.nodes[n]["state"] for n in G.nodes()}
+
+    def counts():
+        s = sum(1 for n in G.nodes() if G.nodes[n]["state"] == "S")
+        i = sum(1 for n in G.nodes() if G.nodes[n]["state"] == "I")
+        l = sum(1 for n in G.nodes() if G.nodes[n]["state"] == "L")
+        r = sum(1 for n in G.nodes() if G.nodes[n]["state"] == "R")
+        return s, i, l, r
+
+    states_over_time.append(snapshot())
+    s, i, l, r = counts()
+    history.append({"step": 0, "S": s, "I": i, "L": l, "R": r,
+                    "phase": get_phase(0)})
+
+    for t in range(1, max_steps + 1):
+        log = sir_step(G, t)
+        for event in log:
+            layer_totals[event["layer"]] += 1
+
+        states_over_time.append(snapshot())
+        s, i, l, r = counts()
+        history.append({"step": t, "S": s, "I": i, "L": l, "R": r,
+                        "phase": get_phase(t)})
+
+        if i == 0 and l == 0:
+            print(f"  Outbreak ended at step {t}  "
+                  f"({DAY_NAMES[t % 7]}, {get_phase(t)})")
+            break
+
+    return history, states_over_time, layer_totals
+
+
+# ============================================================
+# SECTION 8 — STATIC NETWORK: LAYER-BY-LAYER (2×3 grid)
+# ============================================================
+
+def draw_static_network(G, pos):
+    """
+    Six-panel figure showing each layer separately plus a combined view.
+    Eliminates the "hairball" problem — each panel is clean and readable.
+    """
+    initial_states = {n: G.nodes[n]["state"] for n in G.nodes()}
+
+    layers_info = [
+        ("household",     "Household\n(always active)"),
+        ("work",          "Workplace\n(weekdays only)"),
+        ("school",        "School\n(weekdays only)"),
+        ("neighbor",      "Neighbor\n(all week, low β)"),
+        ("social_weekend","Social weekend\n(weekends only)"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+    axes_flat = axes.flatten()
+
+    for idx, (layer, title) in enumerate(layers_info):
+        ax       = axes_flat[idx]
+        edgelist = [(u, v) for u, v, d in G.edges(data=True)
+                    if d.get("layer") == layer]
+        others   = [(u, v) for u, v, d in G.edges(data=True)
+                    if d.get("layer") != layer]
+
+        # Faint context edges
+        if others:
+            nx.draw_networkx_edges(G, pos, edgelist=others,
+                                   edge_color="#CCCCCC", width=0.3,
+                                   alpha=0.12, ax=ax)
+        # This layer's edges
+        if edgelist:
+            nx.draw_networkx_edges(G, pos, edgelist=edgelist,
+                                   edge_color=LAYER_COLORS[layer],
+                                   width=1.8, alpha=0.70, ax=ax)
+
+        draw_nodes_by_type(G, pos, initial_states, ax, size_scale=0.85)
+        ax.set_title(title, fontsize=11, pad=6)
+        ax.axis("off")
+        ax.text(0.02, 0.02, f"{len(edgelist)} edges",
+                transform=ax.transAxes, fontsize=8,
+                color=LAYER_COLORS[layer])
+
+    # Sixth panel: weekday combined view
+    ax = axes_flat[5]
+    for layer, color in LAYER_COLORS.items():
+        edgelist = [(u, v) for u, v, d in G.edges(data=True)
+                    if d.get("layer") == layer]
+        active   = edge_is_active(layer, "weekday")
+        if edgelist:
+            nx.draw_networkx_edges(G, pos, edgelist=edgelist,
+                                   edge_color=color,
+                                   width=1.5 if active else 0.3,
+                                   alpha=0.65 if active else 0.08,
+                                   ax=ax)
+    draw_nodes_by_type(G, pos, initial_states, ax, size_scale=0.85)
+    ax.set_title("Combined — weekday view\n(faded = dormant layers)", fontsize=11)
+    ax.axis("off")
+
+    # Shared legends
+    edge_leg = [Line2D([0],[0], color=c, lw=2, label=l)
+                for l, c in LAYER_COLORS.items()]
+    shape_leg = [
+        Line2D([0],[0], marker="s", color="w", markerfacecolor="#777",
+               markersize=9, label="■  Worker"),
+        Line2D([0],[0], marker="^", color="w", markerfacecolor="#777",
+               markersize=9, label="▲  Child"),
+        Line2D([0],[0], marker="o", color="w", markerfacecolor="#777",
+               markersize=9, label="●  Stay-home adult"),
+    ]
+    fig.legend(handles=edge_leg + shape_leg, loc="lower center",
+               ncol=4, fontsize=9, framealpha=0.9,
+               bbox_to_anchor=(0.5, 0.01))
+    fig.suptitle("Contact Network — Layer-by-Layer View",
+                 fontsize=14, y=1.01)
+    plt.tight_layout(rect=[0, 0.07, 1, 1])
+    plt.savefig("network_layers.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: network_layers.png")
+
+
+# ============================================================
+# SECTION 9 — ANIMATION
+# ============================================================
+
+def animate_sir(G, pos, states_over_time, history):
+    """
+    Animated SIRL spread.
+    - Households visible as tight clusters on a circle
+    - Edges truly disappear when their layer is dormant
+    - Node shape = type, node color = SIRL state
+    - Amber nodes (L) = on sick leave at home
+    - Space = pause/play, R = reset
+    """
+    print("  Building animation...")
+
+    edges_by_layer = {layer: [] for layer in LAYER_COLORS}
+    for u, v, data in G.edges(data=True):
+        layer = data.get("layer", "household")
+        if layer in edges_by_layer:
+            edges_by_layer[layer].append((u, v))
+
+    df       = pd.DataFrame(history)
+    N        = G.number_of_nodes()
+    n_frames = len(states_over_time)
+
+    fig = plt.figure(figsize=(18, 8))
+    gs  = GridSpec(1, 2, width_ratios=[1.8, 1], figure=fig)
+    ax_net = fig.add_subplot(gs[0])
+    ax_sir = fig.add_subplot(gs[1])
+
+    edge_legend = [
+        Line2D([0],[0], color=LAYER_COLORS["household"],      lw=2.5,
+               label="Household — always active"),
+        Line2D([0],[0], color=LAYER_COLORS["work"],           lw=2.5,
+               label="Work — weekdays only"),
+        Line2D([0],[0], color=LAYER_COLORS["school"],         lw=2.5,
+               label="School — weekdays only"),
+        Line2D([0],[0], color=LAYER_COLORS["neighbor"],       lw=2.5,
+               label="Neighbor — all week"),
+        Line2D([0],[0], color=LAYER_COLORS["social_weekend"], lw=2.5,
+               label="Social — weekends only"),
+    ]
+    shape_legend = [
+        Line2D([0],[0], marker="s", color="w", markerfacecolor="#888",
+               markersize=9, label="■ Worker"),
+        Line2D([0],[0], marker="^", color="w", markerfacecolor="#888",
+               markersize=9, label="▲ Child"),
+        Line2D([0],[0], marker="o", color="w", markerfacecolor="#888",
+               markersize=9, label="● Stay-home"),
+    ]
+    state_legend = [
+        mpatches.Patch(color=STATE_COLORS["S"], label="Susceptible"),
+        mpatches.Patch(color=STATE_COLORS["I"], label="Infected (out)"),
+        mpatches.Patch(color=STATE_COLORS["L"], label="Sick leave (home)"),
+        mpatches.Patch(color=STATE_COLORS["R"], label="Recovered"),
+    ]
+
+    def update(frame):
+        ax_net.clear()
+        ax_sir.clear()
+
+        states = states_over_time[frame]
+        phase  = history[frame]["phase"]
+        step   = history[frame]["step"]
+
+        # Pre-compute which nodes are infectious this frame
+        infectious = {n for n in G.nodes()
+                      if states[n] in ("I", "L")}
+
+        for layer, edgelist in edges_by_layer.items():
+            if not edgelist:
+                continue
+
+            active = edge_is_active(layer, phase)
+
+            # Split edges into three visual groups:
+            #   spreading  — at least one end is infectious AND layer is active
+            #   active     — layer is active but neither end is infectious
+            #   dormant    — layer is structurally off this phase
+            spreading = []
+            just_active = []
+            dormant = []
+
+            for u, v in edgelist:
+                if not active:
+                    dormant.append((u, v))
+                elif states[u] in ("I", "L") or states[v] in ("I", "L"):
+                    spreading.append((u, v))
+                else:
+                    just_active.append((u, v))
+
+            # Dormant — faded out, layer color but very transparent
+            if dormant:
+                nx.draw_networkx_edges(
+                    G, pos,
+                    edgelist   = dormant,
+                    edge_color = LAYER_COLORS[layer],
+                    width      = 0.5,
+                    alpha      = 0.08,
+                    ax         = ax_net
+                )
+
+            # Active but not spreading — visible but not highlighted
+            if just_active:
+                nx.draw_networkx_edges(
+                    G, pos,
+                    edgelist   = just_active,
+                    edge_color = LAYER_COLORS[layer],
+                    width      = 1.0,
+                    alpha      = 0.30,
+                    ax         = ax_net
+                )
+
+            # Actively spreading — full color, thicker, most prominent
+            if spreading:
+                nx.draw_networkx_edges(
+                    G, pos,
+                    edgelist   = spreading,
+                    edge_color = LAYER_COLORS[layer],
+                    width      = 2.5,
+                    alpha      = 0.90,
+                    ax         = ax_net
+                )
+
+        draw_nodes_by_type(G, pos, states, ax_net)
+
+        ax_net.set_title(
+            f"Day {step}  ·  {DAY_NAMES[step % 7]}  ·  {phase.capitalize()}\n"
+            f"S={history[frame]['S']}   I={history[frame]['I']}   "
+            f"L={history[frame]['L']}   R={history[frame]['R']}",
+            fontsize=12
+        )
+        ax_net.axis("off")
+        ax_net.legend(handles=edge_legend + shape_legend + state_legend,
+                      loc="upper left", fontsize=7, framealpha=0.92)
+
+        # Growing SIR curves
+        steps = df["step"][:frame + 1]
+        ax_sir.plot(steps, df["S"][:frame+1], color=STATE_COLORS["S"],
+                    lw=2, label="Susceptible")
+        ax_sir.plot(steps, df["I"][:frame+1], color=STATE_COLORS["I"],
+                    lw=2, label="Infected")
+        ax_sir.plot(steps, df["L"][:frame+1], color=STATE_COLORS["L"],
+                    lw=2, ls="--", label="Sick leave")
+        ax_sir.plot(steps, df["R"][:frame+1], color=STATE_COLORS["R"],
+                    lw=2, label="Recovered")
+
+        for start in range(0, n_frames, 7):
+            ax_sir.axvspan(start + 5, min(start + 7, n_frames),
+                           color="#EBEBEB", alpha=0.55, zorder=0)
+
+        ax_sir.set_xlim(0, n_frames)
+        ax_sir.set_ylim(0, N)
+        ax_sir.set_xlabel("Day", fontsize=10)
+        ax_sir.set_ylabel("Nodes", fontsize=10)
+        ax_sir.set_title("SIRL Curves\n(gray = weekend)", fontsize=11)
+        ax_sir.legend(fontsize=9)
+    ctrl = {"playing": True}
+
+    ani  = animation.FuncAnimation(
+        fig, update,
+        frames=n_frames, interval=280, repeat=False
+    )
+
+    def on_key(event):
+        if event.key == " ":
+            ctrl["playing"] = not ctrl["playing"]
+            ani.event_source.start() if ctrl["playing"] \
+                else ani.event_source.stop()
+        elif event.key == "r":
+            ctrl["playing"] = True
+            ani.event_source.stop()
+            update(0)
+            fig.canvas.draw_idle()
+            ani.frame_seq = ani.new_frame_seq()
+            ani.event_source.start()
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    fig.text(0.5, 0.005, "Space = play / pause     R = reset",
+             ha="center", fontsize=9, color="gray")
+    plt.tight_layout()
+
+    try:
+        ani.save("sir_animation.gif", writer="pillow", fps=5, dpi=100)
+        print("  Saved: sir_animation.gif")
+    except Exception as e:
+        print(f"  Could not save gif ({e})")
+
+    plt.show()
+
+
+# ============================================================
+# SECTION 10 — SIRL CURVES
+# ============================================================
+
+def plot_sir_curves(history):
+    df  = pd.DataFrame(history)
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    t_max = df["step"].max()
+    for start in range(0, t_max + 1, 7):
+        ax.axvspan(start + 5, min(start + 7, t_max),
+                   color="#EBEBEB", alpha=0.65, zorder=0)
+
+    ax.plot(df["step"], df["S"], color=STATE_COLORS["S"], lw=2,
+            label="Susceptible")
+    ax.plot(df["step"], df["I"], color=STATE_COLORS["I"], lw=2,
+            label="Infected (still going out)")
+    ax.plot(df["step"], df["L"], color=STATE_COLORS["L"], lw=2, ls="--",
+            label="On sick leave (home)")
+    ax.plot(df["step"], df["R"], color=STATE_COLORS["R"], lw=2,
+            label="Recovered")
+
+    peak_idx = df["I"].idxmax()
+    peak_t   = df.loc[peak_idx, "step"]
+    peak_val = df.loc[peak_idx, "I"]
+    ax.axvline(peak_t, color=STATE_COLORS["I"], lw=1, ls=":", alpha=0.6)
+    ax.annotate(f"Peak I: {peak_val} (day {peak_t})",
+                xy=(peak_t, peak_val),
+                xytext=(peak_t + 3, peak_val * 0.88),
+                fontsize=9, color=STATE_COLORS["I"])
+
+    handles = [
+        Line2D([0],[0], color=STATE_COLORS["S"], lw=2, label="Susceptible"),
+        Line2D([0],[0], color=STATE_COLORS["I"], lw=2,
+               label="Infected (still out)"),
+        Line2D([0],[0], color=STATE_COLORS["L"], lw=2, ls="--",
+               label="Sick leave (home)"),
+        Line2D([0],[0], color=STATE_COLORS["R"], lw=2, label="Recovered"),
+        mpatches.Patch(color="#EBEBEB", alpha=0.7, label="Weekend"),
+    ]
+    ax.legend(handles=handles, fontsize=10)
+    ax.set_xlabel("Day", fontsize=11)
+    ax.set_ylabel("Number of nodes", fontsize=11)
+    ax.set_title(
+        f"SIRL Curves — Temporal Structured Network\n"
+        f"p_leave={SICK_LEAVE_PROB}  γ={GAMMA}  γ_leave={GAMMA_ON_LEAVE}  "
+        f"leave_duration={SICK_LEAVE_DURATION} days",
+        fontsize=12)
+    ax.set_xlim(0)
+    ax.set_ylim(0)
+    plt.tight_layout()
+    plt.savefig("sirl_curves.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: sirl_curves.png")
+
+
+# ============================================================
+# SECTION 11 — SICK LEAVE COMPLIANCE COMPARISON
+# Runs the simulation 4 times with different SICK_LEAVE_PROB.
+# Shows how voluntary compliance affects outbreak size.
+# ============================================================
+
+def plot_sick_leave_comparison():
+    """
+    Overlays infected curves for four compliance scenarios.
+    This is one of the strongest figures for a research paper —
+    shows how voluntary behavior change affects community spread.
+    """
+    compliance_levels = [
+        (0.00, "#888780", "--", "No sick leave (p=0.00)"),
+        (0.20, "#BA7517", "-.", "Low compliance (p=0.20)"),
+        (0.40, "#E24B4A", "-",  "Moderate compliance (p=0.40)"),
+        (0.70, "#1D9E75", "-",  "High compliance (p=0.70)"),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for prob, color, ls, label in compliance_levels:
+        print(f"  Running sick leave scenario: p={prob}...")
+        G_run, _, _ = build_network(seed=RANDOM_SEED)
+
+        # Temporarily override SICK_LEAVE_PROB
+        import builtins
+        original = SICK_LEAVE_PROB
+
+        # Run with custom prob by monkey-patching the step function
+        history_run = _run_with_leave_prob(G_run, prob)
+        df = pd.DataFrame(history_run)
+
+        axes[0].plot(df["step"], df["I"], color=color, lw=2,
+                     ls=ls, label=label)
+        axes[1].plot(df["step"], df["I"] + df["L"], color=color,
+                     lw=2, ls=ls, label=label)
+
+    for ax in axes:
+        t_max = MAX_STEPS
+        for start in range(0, t_max, 7):
+            ax.axvspan(start + 5, min(start + 7, t_max),
+                       color="#EBEBEB", alpha=0.4, zorder=0)
+        ax.set_xlabel("Day", fontsize=11)
+        ax.set_ylabel("Nodes", fontsize=11)
+        ax.legend(fontsize=9)
+        ax.set_xlim(0)
+        ax.set_ylim(0)
+
+    axes[0].set_title("Active infected (state I)\n"
+                      "Nodes still going out", fontsize=12)
+    axes[1].set_title("Total infectious (I + L)\n"
+                      "Everyone who could spread disease", fontsize=12)
+
+    fig.suptitle("Effect of Sick Leave Compliance on Outbreak Dynamics\n"
+                 "(gray shading = weekends)", fontsize=13)
+    plt.tight_layout()
+    plt.savefig("sick_leave_comparison.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: sick_leave_comparison.png")
+
+
+def _run_with_leave_prob(G, leave_prob):
+    """Helper — runs simulation with a custom sick leave probability."""
+    history = []
+
+    def counts():
+        s = sum(1 for n in G.nodes() if G.nodes[n]["state"] == "S")
+        i = sum(1 for n in G.nodes() if G.nodes[n]["state"] == "I")
+        l = sum(1 for n in G.nodes() if G.nodes[n]["state"] == "L")
+        r = sum(1 for n in G.nodes() if G.nodes[n]["state"] == "R")
+        return s, i, l, r
+
+    s, i, l, r = counts()
+    history.append({"step": 0, "S": s, "I": i, "L": l, "R": r})
+
+    for t in range(1, MAX_STEPS + 1):
+        phase      = get_phase(t)
+        new_states = {n: G.nodes[n]["state"] for n in G.nodes()}
+        new_ldays  = {n: G.nodes[n]["leave_days"] for n in G.nodes()}
+        new_asymptomatic_days = {n: G.nodes[n]["asymptomatic_days"]  for n in G.nodes()}
+
+        for u, v, data in G.edges(data=True):
+            layer = data.get("layer", "household")
+            if not edge_is_active(layer, phase):
+                continue
+            u_on_leave = G.nodes[u]["state"] == "L"
+            v_on_leave = G.nodes[v]["state"] == "L"
+            if layer in ("work", "school", "social_weekend"):
+                if u_on_leave or v_on_leave:
+                    continue
+            beta = BETA_BY_LAYER.get(layer, 0.0)
+            if layer in ("school", "social_weekend"):
+                a_u  = G.nodes[u].get("social_activity", 1.0)
+                a_v  = G.nodes[v].get("social_activity", 1.0)
+                beta = beta * (a_u + a_v) / 2
+            u_inf = G.nodes[u]["state"] in ("I", "L")
+            v_inf = G.nodes[v]["state"] in ("I", "L")
+            if u_inf and G.nodes[v]["state"] == "S":
+                if random.random() < beta:
+                    new_states[v] = "I"
+            if v_inf and G.nodes[u]["state"] == "S":
+                if random.random() < beta:
+                    new_states[u] = "I"
+
+        for n in G.nodes():
+            state = G.nodes[n]["state"]
+            if state == "I":
+                if random.random() < leave_prob:
+                    new_states[n] = "L"
+                    new_ldays[n]  = 1
+                elif random.random() < GAMMA:
+                    new_states[n] = "R"
+            elif state == "L":
+                days = G.nodes[n]["leave_days"] + 1
+                if days >= SICK_LEAVE_DURATION or random.random() < GAMMA_ON_LEAVE:
+                    new_states[n] = "R"
+                    new_ldays[n]  = 0
+                else:
+                    new_ldays[n] = days
+
+        for n in G.nodes():
+            G.nodes[n]["state"]      = new_states[n]
+            G.nodes[n]["leave_days"] = new_ldays[n]
+            G.nodes[n]["asymptomatic_days"]  = new_asymptomatic_days[n]
+
+        s, i, l, r = counts()
+        history.append({"step": t, "S": s, "I": i, "L": l, "R": r})
+        if i == 0 and l == 0:
+            break
+
+    return history
+
+
+# ============================================================
+# SECTION 12 — CHILD ACTIVITY DISTRIBUTION
+# ============================================================
+
+def plot_child_activity_distribution(G):
+    activities = [G.nodes[n]["social_activity"]
+                  for n in G.nodes() if G.nodes[n]["type"] == "child"]
+    if not activities:
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(activities, bins=15, color=STATE_COLORS["S"],
+            edgecolor="white", alpha=0.85)
+    mean_a = np.mean(activities)
+    ax.axvline(mean_a, color=STATE_COLORS["I"], lw=2, ls="--",
+               label=f"Mean = {mean_a:.2f}")
+    ax.set_xlabel(
+        f"Social activity level  a_i ~ Beta({CHILD_ACTIVITY_ALPHA}, "
+        f"{CHILD_ACTIVITY_BETA})", fontsize=11)
+    ax.set_ylabel("Number of children", fontsize=11)
+    ax.set_title("Child Social Activity Distribution\n"
+                 "0 = always stays home · 1 = always sees friends",
+                 fontsize=12)
+    ax.legend(fontsize=10)
+    ax.set_xlim(0, 1)
+    plt.tight_layout()
+    plt.savefig("child_activity_dist.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: child_activity_dist.png")
+
+
+# ============================================================
+# SECTION 13 — DEGREE DISTRIBUTION
+# ============================================================
+
+def plot_degree_distribution(G):
+    type_info = {
+        "worker"    : ("#378ADD", "Workers"),
+        "child"     : ("#1D9E75", "Children"),
+        "stay_home" : ("#D85A30", "Stay-home adults"),
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    for col_idx, phase in enumerate(("weekday", "weekend")):
+        ax = axes[col_idx]
+        for ntype, (color, label) in type_info.items():
+            nodes   = [n for n in G.nodes() if G.nodes[n]["type"] == ntype]
+            degrees = [
+                sum(1 for nbr in G.neighbors(n)
+                    if edge_is_active(G[n][nbr].get("layer","household"), phase))
+                for n in nodes
+            ]
+            if degrees:
+                ax.hist(degrees, bins=range(0, max(degrees) + 2),
+                        alpha=0.65, color=color, label=label,
+                        edgecolor="white")
+        ax.set_xlabel("Active contacts", fontsize=11)
+        ax.set_ylabel("Number of nodes", fontsize=11)
+        ax.set_title(f"Degree distribution — {phase.capitalize()}", fontsize=12)
+        ax.legend(fontsize=9)
+
+    fig.suptitle("Contact Degree Distribution by Node Type and Time Phase\n"
+                 "Stay-home adults have fewest outside contacts (1–2)",
+                 fontsize=13)
+    plt.tight_layout()
+    plt.savefig("degree_distribution.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: degree_distribution.png")
+
+
+# ============================================================
+# SECTION 14 — CONTACT INTENSITY λ_i(t)
+# ============================================================
+
+def compute_contact_intensity(G):
+    intensity = {}
+    for phase in ("weekday", "weekend"):
+        intensity[phase] = {
+            n: sum(1 for nbr in G.neighbors(n)
+                   if edge_is_active(G[n][nbr].get("layer","household"), phase))
+            for n in G.nodes()
+        }
+    return intensity
+
+
+def plot_contact_intensity(G):
+    intensity = compute_contact_intensity(G)
+    types     = ["worker", "child", "stay_home"]
+    labels    = ["Workers", "Children", "Stay-home adults"]
+    wd_means  = []
+    we_means  = []
+
+    for ntype in types:
+        group = [n for n in G.nodes() if G.nodes[n]["type"] == ntype]
+        wd_means.append(np.mean([intensity["weekday"][n] for n in group])
+                        if group else 0)
+        we_means.append(np.mean([intensity["weekend"][n] for n in group])
+                        if group else 0)
+
+    x, width = np.arange(len(types)), 0.35
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(x - width/2, wd_means, width, label="Weekday",
+           color="#378ADD", alpha=0.85)
+    ax.bar(x + width/2, we_means, width, label="Weekend",
+           color="#D85A30", alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.set_ylabel("Expected active contacts  λ_i(t)", fontsize=11)
+    ax.set_title("Contact Intensity by Node Type and Time Phase\n"
+                 "λ_i(t) = Σ_j  p_ij(t)", fontsize=12)
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    plt.savefig("contact_intensity.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: contact_intensity.png")
+
+
+# ============================================================
+# SECTION 15 — LAYER BREAKDOWN
+# ============================================================
+
+def plot_layer_breakdown(layer_totals):
+    layers = list(layer_totals.keys())
+    counts = [layer_totals[l] for l in layers]
+    colors = [LAYER_COLORS.get(l, "#888780") for l in layers]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars    = ax.bar(layers, counts, color=colors,
+                     edgecolor="white", linewidth=0.8)
+    ax.bar_label(bars, padding=3, fontsize=10)
+    ax.set_ylabel("Transmission events", fontsize=11)
+    ax.set_title("Transmission Events by Contact Layer\n"
+                 "Which contact type drove the most infections?",
+                 fontsize=12)
+    ax.set_ylim(0, max(counts) * 1.2 if counts else 1)
+    plt.tight_layout()
+    plt.savefig("layer_breakdown.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: layer_breakdown.png")
+
+
+# ============================================================
+# SECTION 16 — STATIC vs TEMPORAL COMPARISON
+# ============================================================
+
+def compare_static_vs_temporal():
+    print("  Running static baseline...")
+    G_s, _, _ = build_network(seed=RANDOM_SEED)
+
+    static_hist = []
+    def c_s():
+        return (sum(1 for n in G_s.nodes() if G_s.nodes[n]["state"] == "S"),
+                sum(1 for n in G_s.nodes() if G_s.nodes[n]["state"] == "I"),
+                sum(1 for n in G_s.nodes() if G_s.nodes[n]["state"] == "R"))
+
+    s, i, r = c_s()
+    static_hist.append({"step": 0, "I": i})
+    for t in range(1, MAX_STEPS + 1):
+        ns = {n: G_s.nodes[n]["state"] for n in G_s.nodes()}
+        for u, v, data in G_s.edges(data=True):
+            beta = BETA_BY_LAYER.get(data.get("layer","household"), 0.05)
+            if G_s.nodes[u]["state"] == "I" and G_s.nodes[v]["state"] == "S":
+                if random.random() < beta: ns[v] = "I"
+            if G_s.nodes[v]["state"] == "I" and G_s.nodes[u]["state"] == "S":
+                if random.random() < beta: ns[u] = "I"
+        for n in G_s.nodes():
+            if G_s.nodes[n]["state"] == "I":
+                if random.random() < GAMMA: ns[n] = "R"
+        for n in G_s.nodes():
+            G_s.nodes[n]["state"] = ns[n]
+        s, i, r = c_s()
+        static_hist.append({"step": t, "I": i})
+        if i == 0: break
+
+    print("  Running temporal model...")
+    G_t, _, _ = build_network(seed=RANDOM_SEED)
+    temp_hist, _, _ = run_simulation(G_t)
+
+    df_s = pd.DataFrame(static_hist)
+    df_t = pd.DataFrame(temp_hist)
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    t_max = max(df_s["step"].max(), df_t["step"].max())
+    for start in range(0, t_max + 1, 7):
+        ax.axvspan(start + 5, min(start + 7, t_max),
+                   color="#EBEBEB", alpha=0.5, zorder=0)
+
+    ax.plot(df_s["step"], df_s["I"], color="#888780", lw=2, ls="--",
+            label="Static model (all edges always active)")
+    ax.plot(df_t["step"], df_t["I"] + df_t["L"], color=STATE_COLORS["I"],
+            lw=2, label="Temporal model (I + L combined)")
+
+    handles = [
+        Line2D([0],[0], color="#888780", lw=2, ls="--",
+               label="Static model"),
+        Line2D([0],[0], color=STATE_COLORS["I"], lw=2,
+               label="Temporal model (I + L)"),
+        mpatches.Patch(color="#EBEBEB", alpha=0.7, label="Weekend"),
+    ]
+    ax.legend(handles=handles, fontsize=10)
+    ax.set_xlabel("Day", fontsize=11)
+    ax.set_ylabel("Infectious nodes", fontsize=11)
+    ax.set_title("Static vs Temporal SIRL — Total Infectious Over Time",
+                 fontsize=12)
+    ax.set_xlim(0)
+    ax.set_ylim(0)
+    plt.tight_layout()
+    plt.savefig("static_vs_temporal.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("Saved: static_vs_temporal.png")
+
+
+# ============================================================
+# SECTION 17 — EXPORT CSV
+# ============================================================
+
+def export_csv(history, layer_totals, filename="sirl_data.csv"):
+    df = pd.DataFrame(history)
+    df["total"]        = df["S"] + df["I"] + df["L"] + df["R"]
+    df["pct_infected"] = ((df["I"] + df["L"]) / df["total"] * 100).round(2)
+    df.to_csv(filename, index=False)
+    print(f"\nSaved: {filename}")
+    print(df.head(14).to_string(index=False))
+    print("\nTransmission events by layer:")
+    mx = max(layer_totals.values()) if layer_totals and max(layer_totals.values()) > 0 else 1
+    for layer, count in sorted(layer_totals.items(), key=lambda x: -x[1]):
+        bar = "█" * max(1, count * 25 // mx)
+        print(f"  {layer:14s}: {count:4d}  {bar}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 57)
+    print("  Temporal Structured SIRL Network Model")
+    print("=" * 57)
+
+    print("\n[1/8] Building network...")
+    G, households, pos = build_network()
+    N     = G.number_of_nodes()
+    sizes = [len(h) for h in households]
+
+    print(f"      {N} total nodes  |  {NUM_HOUSEHOLDS} households")
+    print(f"      Household sizes: "
+          f"min={min(sizes)}  max={max(sizes)}  avg={np.mean(sizes):.1f}")
+
+    type_counts = {}
+    for n in G.nodes():
+        t = G.nodes[n]["type"]
+        type_counts[t] = type_counts.get(t, 0) + 1
+    for t, c in type_counts.items():
+        print(f"        {t:12s}: {c}")
+
+    layer_ec = {}
+    for u, v, d in G.edges(data=True):
+        l = d.get("layer","?")
+        layer_ec[l] = layer_ec.get(l, 0) + 1
+    for l, c in layer_ec.items():
+        print(f"        {l:14s} edges: {c}")
+
+    children = [n for n in G.nodes() if G.nodes[n]["type"] == "child"]
+    if children:
+        acts = [G.nodes[n]["social_activity"] for n in children]
+        print(f"        Child social activity: "
+              f"mean={np.mean(acts):.2f}  "
+              f"min={min(acts):.2f}  max={max(acts):.2f}")
+
+    print("\n[2/8] Drawing layer-by-layer network structure...")
+    draw_static_network(G, pos)
+
+    print("\n[3/8] Plotting child activity distribution...")
+    plot_child_activity_distribution(G)
+
+    print("\n[4/8] Running SIRL simulation...")
+    history, states_over_time, layer_totals = run_simulation(G)
+    peak_i = max(h["I"] for h in history)
+    peak_l = max(h["L"] for h in history)
+    print(f"      Peak infected (I):    {peak_i}/{N}  ({100*peak_i/N:.1f}%)")
+    print(f"      Peak on leave  (L):   {peak_l}/{N}  ({100*peak_l/N:.1f}%)")
+
+    print("\n[5/8] Plotting SIRL curves + layer breakdown...")
+    plot_sir_curves(history)
+    plot_layer_breakdown(layer_totals)
+
+    print("\n[6/8] Degree distribution + contact intensity...")
+    plot_degree_distribution(G)
+    plot_contact_intensity(G)
+
+    print("\n[7/8] Comparison figures...")
+    compare_static_vs_temporal()
+    plot_sick_leave_comparison()
+
+    export_csv(history, layer_totals)
+
+    print("\n[8/8] Launching animation...")
+    print("      Space = play/pause     R = reset")
+    animate_sir(G, pos, states_over_time, history)
+    print("\nOutput files:")
+    for f in ["network_layers.png",       "child_activity_dist.png",
+              "sirl_curves.png",           "layer_breakdown.png",
+              "degree_distribution.png",   "contact_intensity.png",
+              "static_vs_temporal.png",    "sick_leave_comparison.png",
+              "sir_animation.gif",         "sirl_data.csv"]:
+        print(f"  {f}")
