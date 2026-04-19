@@ -42,6 +42,7 @@ Requirements:
 """
 
 import random
+from tkinter import NONE
 import numpy as np
 import pandas as pd
 import networkx as nx
@@ -87,24 +88,24 @@ CHILD_ACTIVITY_ALPHA  = 2
 CHILD_ACTIVITY_BETA   = 3
 
 # --- Layer transmission rates β ---
-BETA_HOUSEHOLD        = 0.15    # close prolonged contact
-BETA_WORK             = 0.08    # workplace
-BETA_SCHOOL           = 0.10    # school (further scaled by child activity)
-BETA_NEIGHBOR         = 0.02    # casual neighbor — low because all-week
-BETA_SOCIAL_WEEKEND   = 0.06    # weekend social
+BETA_HOUSEHOLD        = 0.3    # close prolonged contact
+BETA_WORK             = 0.3    # workplace
+BETA_SCHOOL           = 0.3    # school (further scaled by child activity)
+BETA_NEIGHBOR         = 0.3    # casual neighbor — low because all-week
+BETA_SOCIAL_WEEKEND   = 0.3    # weekend social
 
 # --- Recovery ---
-GAMMA                 = 0.07    # daily recovery prob for I nodes
+GAMMA                 = 0.2    # daily recovery prob for I nodes
 GAMMA_ON_LEAVE        = 0.18    # faster recovery while resting at home
 
 # --- Sick leave ---
-SICK_LEAVE_PROB       = 0.35    # prob infected node takes leave per day
+SICK_LEAVE_PROB       = 0.0    # prob infected node takes leave per day
                                  # not everyone reports symptoms
 SICK_LEAVE_DURATION   = 4       # max days on leave before forced recovery
 
 # --- Simulation ---
 MAX_STEPS             = 120
-RANDOM_SEED           = 42
+RANDOM_SEED           = NONE
 
 # --- Visual colors ---
 LAYER_COLORS = {
@@ -772,18 +773,42 @@ def animate_sir(G, pos, states_over_time, history):
         ax_sir.legend(fontsize=9)
     ctrl = {"playing": True}
 
-    ani  = animation.FuncAnimation(
+    ani_interval = 280
+
+    ani = animation.FuncAnimation(
         fig, update,
-        frames=n_frames, interval=280, repeat=False
+        frames=n_frames, interval=ani_interval, repeat=False
     )
+
+    def ensure_event_source():
+        """
+        Ensure `ani.event_source` exists. Some backends or saving
+        operations can leave `event_source` as None — create a
+        timer and attach the animation's internal step callback.
+        """
+        if getattr(ani, "event_source", None) is None:
+            interval = getattr(ani, "_interval", ani_interval)
+            timer = fig.canvas.new_timer(interval=interval)
+            # Use the animation's internal step method as the callback
+            try:
+                timer.add_callback(ani._step)
+            except Exception:
+                # Fallback if add_callback signature differs
+                timer.add_callback(lambda: getattr(ani, "_step")())
+            ani.event_source = timer
 
     def on_key(event):
         if event.key == " ":
             ctrl["playing"] = not ctrl["playing"]
-            ani.event_source.start() if ctrl["playing"] \
-                else ani.event_source.stop()
+            ensure_event_source()
+            if ctrl["playing"]:
+                ani.event_source.start()
+            else:
+                ani.event_source.stop()
         elif event.key == "r":
             ctrl["playing"] = True
+            ensure_event_source()
+            # Stop timer, force frame 0 render, reset frame iterator, restart
             ani.event_source.stop()
             update(0)
             fig.canvas.draw_idle()

@@ -40,8 +40,8 @@ import random
 # --- Population ---
 N_NODES = 0                 # number of people (nodes)
 HOUSEHOLD_SIZE_MEAN = 4     # average people per household
-HOUSEHOLD_SIZE_STD = 0.75
-NUM_HOUSEHOLDS = 15         # number of households
+HOUSEHOLD_SIZE_STD = 4/3
+NUM_HOUSEHOLDS = 20         # number of households
 
 # --- Disease parameters ---
 BETA = 0.30                 # transmission probability per contact per time step
@@ -50,7 +50,7 @@ GAMMA = 0.2                 # recovery probability per time step
                             # higher = people recover faster (try 0.05 to 0.5)
 
 # --- Temporal / activity parameters ---
-BASE_ACTIVITY = 0.1         # base probability that any node is "active" (makes
+BASE_ACTIVITY = 0.3         # base probability that any node is "active" (makes
                             # a community contact) on a given time step.
                             # Each node also gets a small random personal modifier.
 
