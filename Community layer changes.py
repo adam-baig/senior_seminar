@@ -1,23 +1,19 @@
 """
 Temporal Structured SIRL Network Model
-========================================
-Complete implementation including everything discussed:
-
   Mathematical model:
     G_t = (V, E_H ∪ E_W(t) ∪ E_S(t) ∪ E_N ∪ E_SW(t))
 
   Edge layers:
-    E_H       household edges        — always active             (purple)
-    E_W(t)    workplace edges        — weekdays only             (blue)
-    E_S(t)    school edges           — weekdays only, β scaled   (green)
-    E_N       neighbor edges         — all week, low β           (orange)
-    E_SW(t)   social weekend edges   — weekends only             (amber)
+    E_H       household edges        — always active             
+    E_W(t)    workplace edges        — weekdays only            
+    E_S(t)    school edges           — weekdays only, β scaled  
+    E_N       neighbor edges         — all week, low β           
+    E_SW(t)   social weekend edges   — weekends only             
 
   Disease states (SIRL):
     S  susceptible
     I  infected — still going out, all edges active
     L  on sick leave — work/school/social_weekend edges OFF,
-                       household/neighbor edges STILL ACTIVE
     R  recovered
 
   State transitions:
@@ -109,11 +105,11 @@ RANDOM_SEED           = NONE
 
 # --- Visual colors ---
 LAYER_COLORS = {
-    "household"      : "#E6945E",  # orange
-    "work"           : "#EE9AFD",  # dark blue
-    "school"         : "#D4537E",  # pink
-    "neighbor"       : "#7EC8A0",  # pale green
-    "social_weekend" : "#FE838B",  # purple
+    "household"      : "#E63946",  # strong red-pink
+    "work"           : "#1657B3",  # dark navy
+    "school"         : "#F4A261",  # warm orange
+    "neighbor"       : "#2A9D8F",  # teal
+    "social_weekend" : "#8338EC",  # vivid purple
 }
 
 BETA_BY_LAYER = {
@@ -597,11 +593,11 @@ def draw_static_network(G, pos):
                 for l, c in LAYER_COLORS.items()]
     shape_leg = [
         Line2D([0],[0], marker="s", color="w", markerfacecolor="#777",
-               markersize=9, label="■  Worker"),
+               markersize=9, label=" Worker"),
         Line2D([0],[0], marker="^", color="w", markerfacecolor="#777",
-               markersize=9, label="▲  Child"),
+               markersize=9, label=" Child"),
         Line2D([0],[0], marker="o", color="w", markerfacecolor="#777",
-               markersize=9, label="●  Stay-home adult"),
+               markersize=9, label=" Stay-home adult"),
     ]
     fig.legend(handles=edge_leg + shape_leg, loc="lower center",
                ncol=4, fontsize=9, framealpha=0.9,
@@ -658,11 +654,11 @@ def animate_sir(G, pos, states_over_time, history):
     ]
     shape_legend = [
         Line2D([0],[0], marker="s", color="w", markerfacecolor="#888",
-               markersize=9, label="■ Worker"),
+               markersize=9, label="Worker"),
         Line2D([0],[0], marker="^", color="w", markerfacecolor="#888",
-               markersize=9, label="▲ Child"),
+               markersize=9, label="Child"),
         Line2D([0],[0], marker="o", color="w", markerfacecolor="#888",
-               markersize=9, label="● Stay-home"),
+               markersize=9, label="Stay-home"),
     ]
     state_legend = [
         mpatches.Patch(color=STATE_COLORS["S"], label="Susceptible"),
@@ -773,7 +769,7 @@ def animate_sir(G, pos, states_over_time, history):
         ax_sir.legend(fontsize=9)
     ctrl = {"playing": True}
 
-    ani_interval = 280
+    ani_interval = 500
 
     ani = animation.FuncAnimation(
         fig, update,
@@ -863,9 +859,9 @@ def plot_sir_curves(history):
     handles = [
         Line2D([0],[0], color=STATE_COLORS["S"], lw=2, label="Susceptible"),
         Line2D([0],[0], color=STATE_COLORS["I"], lw=2,
-               label="Infected (still out)"),
+               label="Infected"),
         Line2D([0],[0], color=STATE_COLORS["L"], lw=2, ls="--",
-               label="Sick leave (home)"),
+               label="Sick leave"),
         Line2D([0],[0], color=STATE_COLORS["R"], lw=2, label="Recovered"),
         mpatches.Patch(color="#EBEBEB", alpha=0.7, label="Weekend"),
     ]
@@ -1036,11 +1032,10 @@ def plot_child_activity_distribution(G):
     ax.axvline(mean_a, color=STATE_COLORS["I"], lw=2, ls="--",
                label=f"Mean = {mean_a:.2f}")
     ax.set_xlabel(
-        f"Social activity level  a_i ~ Beta({CHILD_ACTIVITY_ALPHA}, "
+        f"Social activity level, "
         f"{CHILD_ACTIVITY_BETA})", fontsize=11)
     ax.set_ylabel("Number of children", fontsize=11)
-    ax.set_title("Child Social Activity Distribution\n"
-                 "0 = always stays home · 1 = always sees friends",
+    ax.set_title("Child Social Activity Distribution\n",
                  fontsize=12)
     ax.legend(fontsize=10)
     ax.set_xlim(0, 1)
@@ -1126,9 +1121,8 @@ def plot_contact_intensity(G):
            color="#D85A30", alpha=0.85)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=11)
-    ax.set_ylabel("Expected active contacts  λ_i(t)", fontsize=11)
-    ax.set_title("Contact Intensity by Node Type and Time Phase\n"
-                 "λ_i(t) = Σ_j  p_ij(t)", fontsize=12)
+    ax.set_ylabel("Expected active contacts", fontsize=11)
+    ax.set_title("Contact Intensity by Node Type and Time Phase\n", fontsize=12)
     ax.legend(fontsize=10)
     plt.tight_layout()
     plt.savefig("contact_intensity.png", dpi=150, bbox_inches="tight")
@@ -1150,8 +1144,7 @@ def plot_layer_breakdown(layer_totals):
                      edgecolor="white", linewidth=0.8)
     ax.bar_label(bars, padding=3, fontsize=10)
     ax.set_ylabel("Transmission events", fontsize=11)
-    ax.set_title("Transmission Events by Contact Layer\n"
-                 "Which contact type drove the most infections?",
+    ax.set_title("Transmission Events by Contact Layer\n",
                  fontsize=12)
     ax.set_ylim(0, max(counts) * 1.2 if counts else 1)
     plt.tight_layout()
