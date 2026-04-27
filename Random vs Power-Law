@@ -1,0 +1,27 @@
+import networkx as nx
+import numpy as np
+
+def simulate_sir_on_graph(G, R0, recovery_rate=0.1):
+    # Calculate transmission rate (beta) based on R0 and average degree (k)
+    # R0 = beta / recovery_rate * <k>
+    avg_degree = sum(dict(G.degree()).values()) / len(G)
+    transmission_rate = (R0 * recovery_rate) / avg_degree
+    
+    # Simple SIR Logic
+    states = {node: 'S' for node in G.nodes()}
+    # Seed the infection
+    initial_infected = list(G.nodes())[0]
+    states[initial_infected] = 'I'
+    
+    # ... rest of your simulation loop ...
+    return states
+
+# 1. Uniform/Random Population (Erdos-Renyi)
+G_random = nx.erdos_renyi_graph(n=1000, p=0.01)
+
+# 2. Realistic "Super-Spreader" Population (Barabasi-Albert)
+G_social = nx.barabasi_albert_graph(n=1000, m=5)
+
+# Compare impact of R0=2.5 on both
+results_random = simulate_sir_on_graph(G_random, R0=2.5)
+results_social = simulate_sir_on_graph(G_social, R0=2.5)
